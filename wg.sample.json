@@ -1,0 +1,13 @@
+{
+  "ip": "10.0.0.12",
+  "listen_port": 12345,
+  "private": "<replace_with_your_private_key>",
+  "peers": [
+    {
+      "ip": "10.0.0.11",
+      "public": "j3KiktmkK3kSIaFa3Rw+GNgPpyR8ZVUzAWxV/Kz1U=<remember_to_edit_this>",
+      "endpoint": "192.168.1.103:12345"
+    }
+  ]
+}
+
