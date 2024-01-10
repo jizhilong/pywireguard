@@ -101,6 +101,7 @@ REJECT_AFTER_TIME = 180
 REKEY_ATTEMPT_TIME = 90
 REKEY_TIMEOUT = 5
 KEEPALIVE_TIMEOUT = 10
+MIN_HANDSHAKE_INTERVAL = 0.05   # 50ms
 
 
 def tai64n(now: float) -> bytes:
@@ -170,7 +171,8 @@ class WgPeer:
         self.node = node
         self.prev_session: WgTransportKeyPair | None = None
         self.cur_session: WgTransportKeyPair | None = None
-        self.next_session: WgHandshake | None = None
+        self.handshake: WgHandshake | None = None
+        self.last_received_handshake_init_tai64n = 0
         self.send_queue = queue.Queue()
         self.last_addr = None
         self.last_received_time = None
@@ -192,12 +194,12 @@ class WgPeer:
 
         if need_new_session:
             self.send_queue.put(data)
-            if self.next_session and time.time() < self.next_session.start_time + REKEY_ATTEMPT_TIME:
+            if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
                 return
             handshake = self.node.init_handshake(self.public)
             addr = self.last_addr or self.endpoint
             self.node.write_udp(handshake.req, addr)
-            self.next_session = handshake
+            self.handshake = handshake
         else:
             data_msg = self.cur_session.encrypt_data(data)
             self.node.write_udp(data_msg, self.last_addr)
@@ -223,11 +225,11 @@ class WgPeer:
 
     def expire_all_sessions_if_necessary(self):
         if self.cur_session and self.cur_session.establish_time + REJECT_AFTER_TIME * 3 < time.time():
-            self.prev_session, self.cur_session, self.next_session = None, None, None
+            self.prev_session, self.cur_session, self.handshake = None, None, None
             logger.info(f'all sessions expired')
 
     def set_cur_session(self, session: WgTransportKeyPair):
-        self.prev_session, self.cur_session, self.next_session = self.cur_session, session, None
+        self.prev_session, self.cur_session, self.handshake = self.cur_session, session, None
         logger.info(f'session rotated (prev, cur) = {self.prev_session}, {self.cur_session}')
         while not self.send_queue.empty():
             data = self.send_queue.get()
@@ -326,6 +328,7 @@ class WgNode:
                     if time.time() - peer.last_send_time >= KEEPALIVE_TIMEOUT:
                         logger.info(f'sending keepalive to {peer.ip}')
                         peer.send_data(b'')
+
     def on_tun_read(self, ip_packet: bytes):
         """called when data read from tun(aka. ip packets to encapsulate in udp)"""
         # check if data is a valid ip packet
@@ -350,13 +353,20 @@ class WgNode:
                 logger.warning('invalid mac1 of handshake init from %s', addr)
                 return
             try:
-                peer_public, keypair, response = self.respond_to_handshake(message)
+                peer_public, timestamp, keypair, response = self.respond_to_handshake(message)
             except (InvalidKey, InvalidTag, InvalidSignature, AssertionError):
                 logger.warning('invalid handshake init from %s', addr)
                 return
             if peer := self.get_peer(peer_public=peer_public):
+                if peer.last_received_handshake_init_tai64n >= timestamp:
+                    logger.warning('handshake init from %s is replayed', addr)
+                    return
+                if peer.cur_session and time.time() - peer.cur_session.establish_time < MIN_HANDSHAKE_INTERVAL:
+                    logger.warning('handshake init from %s is too frequent', addr)
+                    return
                 self.write_udp(response, addr)
                 peer.last_addr = addr
+                peer.last_received_handshake_init_tai64n = timestamp
                 peer.set_cur_session(keypair)
             else:
                 logger.warning('handshake init from %s have no corresponding peer', addr)
@@ -367,7 +377,7 @@ class WgNode:
                 return
             if peer := self.get_peer(handshake_session_id=message.receiver_index):
                 try:
-                    keypair = peer.next_session.on_response(message)
+                    keypair = peer.handshake.on_response(message)
                 except (InvalidKey, InvalidTag, InvalidSignature, AssertionError):
                     logger.warning('invalid handshake response from %s', addr)
                     return
@@ -429,7 +439,7 @@ class WgNode:
         req = HandshakeInit(1, sender_index, ei_pub, encrypted_static, encrypted_timestamp, mac1, mac2)
         return WgHandshake(req, on_response)
 
-    def respond_to_handshake(self, msg: HandshakeInit) -> tuple[bytes, WgTransportKeyPair, HandshakeResponse]:
+    def respond_to_handshake(self, msg: HandshakeInit) -> tuple[bytes, int, WgTransportKeyPair, HandshakeResponse]:
         """called by responder: compose response message and generate keypair.
 
         :param sr_priv: responder's private key
@@ -451,6 +461,7 @@ class WgNode:
         h = hash(h + msg.encrypted_static)
         ck, k = kdf2(ck, dh(sr_priv, si_pub))
         timestamp = decrypt_aead(k, 0, msg.encrypted_timestamp, h)
+
         h = hash(h + msg.encrypted_timestamp)
 
         ck = kdf1(ck, er_pub)
@@ -472,8 +483,8 @@ class WgNode:
         keypair = WgTransportKeyPair(local_id=sender_index, peer_id=receiver_index,
                                      send_key=send_key, recv_key=recv_key,
                                      establish_time=time.time(), is_initiator=False)
-        return si_pub, keypair, HandshakeResponse(2, sender_index, receiver_index, unencrypted_ephemeral,
-                                                  encrypted_nothing, mac1, mac2)
+        return si_pub, int.from_bytes(timestamp, 'big'), keypair,\
+            HandshakeResponse(2, sender_index, receiver_index, unencrypted_ephemeral,encrypted_nothing, mac1, mac2)
 
     def write_udp(self, message: HandshakeInit | HandshakeResponse | DataMessage, addr: tuple[str, int]):
         if isinstance(message, HandshakeInit):
@@ -496,7 +507,7 @@ class WgNode:
                 if peer.prev_session and peer.prev_session.local_id == session_id:
                     return peer
             if handshake_session_id:
-                if peer.next_session and peer.next_session.req.sender_index == handshake_session_id:
+                if peer.handshake and peer.handshake.req.sender_index == handshake_session_id:
                     return peer
         return None
 

@@ -9,7 +9,7 @@ class WgSessionTestCase(unittest.TestCase):
         r_private, r_public = dh_generate()
         i_node, r_node = WgNode('', '', 0, i_private, i_public, []), WgNode('', '', 0, r_private, r_public, [])
         handshake = i_node.init_handshake(r_public)
-        si_pub, r_pair, resp_msg = r_node.respond_to_handshake(handshake.req)
+        si_pub, timestamp, r_pair, resp_msg = r_node.respond_to_handshake(handshake.req)
         i_pair = handshake.on_response(resp_msg)
         assert r_pair.decrypt_data(i_pair.encrypt_data(b'h'*16)) == b'h'*16
         assert si_pub == i_public
