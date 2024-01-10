@@ -1,5 +1,5 @@
 # pywireguard
-A wireguard implementation in python. **for educational purpose only.**
+A [wireguard](https://www.wireguard.com/) implementation in python. **for educational purpose only.**
 
 ## quickstart
 This implementation only works on linux for now, wireguard kernel module is not required.
