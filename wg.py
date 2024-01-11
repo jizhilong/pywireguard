@@ -268,21 +268,6 @@ class IfReq(Structure):
     _fields_ = [("name", c_char * 16), ("flags", c_short)]
 
 
-def new_tun_device():
-    """create a linux tun device and return it"""
-    tun = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
-    # struct.pack an instance of ifreq with setting ifrn_name
-    req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
-    ioctl(tun, TUNSETIFF, req)
-    ioctl(tun, TUNSETOWNER, os.getuid())
-    return tun, req.name.decode()
-
-
-def configure_addr_via_ip_command(ifname, ip: str):
-    subprocess.check_call(f'ip addr add {ip} dev {ifname}', shell=True)
-    subprocess.check_call(f'ip link set dev {ifname} up multicast off arp off', shell=True)
-
-
 class WgNode:
     def __init__(self, ip: str, listen_ip: str, listen_port: int, private: bytes, public: bytes, peers: list[WgPeer]):
         self.ip = ip
@@ -317,13 +302,27 @@ class WgNode:
                 peers.append(WgPeer(peer_ip, peer_endpoint, peer_public, node=node))
             return node
 
-    def serve(self):
+    def _setup_udp_sock(self):
         self.sock: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.listen_ip, self.listen_port))
-        self.tun, ifname = new_tun_device()
-        configure_addr_via_ip_command(ifname, self.ip)
+
+    def _setup_tun_dev(self):
+        """create a linux tun device and return it"""
+        tun = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
+        # struct.pack an instance of ifreq with setting ifrn_name
+        req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
+        ioctl(tun, TUNSETIFF, req)
+        ioctl(tun, TUNSETOWNER, os.getuid())
+        self.tun = tun
+        ifname = req.name.decode()
+        subprocess.check_call(f'ip addr add {self.ip} dev {ifname}', shell=True)
+        subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
         for peer in self.peers:
             subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
+
+    def serve(self):
+        self._setup_udp_sock()
+        self._setup_tun_dev()
         selector = selectors.DefaultSelector()
         selector.register(self.sock, selectors.EVENT_READ)
         selector.register(self.tun, selectors.EVENT_READ)
