@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import select
 import selectors
 import socket
 import struct
@@ -305,6 +306,7 @@ class WgNode:
     def _setup_udp_sock(self):
         self.sock: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.listen_ip, self.listen_port))
+        self.sock.setblocking(False)
 
     def _setup_tun_dev(self):
         """create a linux tun device and return it"""
@@ -313,31 +315,49 @@ class WgNode:
         req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
         ioctl(tun, TUNSETIFF, req)
         ioctl(tun, TUNSETOWNER, os.getuid())
-        self.tun = tun
         ifname = req.name.decode()
         subprocess.check_call(f'ip addr add {self.ip} dev {ifname}', shell=True)
         subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
         for peer in self.peers:
             subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
+        os.set_blocking(tun, False)
+        self.tun = tun
+
+    def _setup_selector(self):
+        selector = selectors.DefaultSelector()
+        selector.register(self.sock, selectors.EVENT_READ)
+        selector.register(self.tun, selectors.EVENT_READ)
+        return selector
 
     def serve(self):
         self._setup_udp_sock()
         self._setup_tun_dev()
-        selector = selectors.DefaultSelector()
-        selector.register(self.sock, selectors.EVENT_READ)
-        selector.register(self.tun, selectors.EVENT_READ)
+        selector = self._setup_selector()
         last_check_alive_time = time.time()
         while True:
-            events = selector.select(timeout=1)
+            events = selector.select(1)
+            udp_ready = tun_ready = False
             for key, mask in events:
-                if not (mask & selectors.EVENT_READ):
-                    continue
                 if key.fd == self.tun:
-                    ip_packet = os.read(self.tun, 65535)
-                    self.on_tun_read(ip_packet)
+                    tun_ready = True
                 elif key.fd == self.sock.fileno():
-                    data, addr = self.sock.recvfrom(65535)
-                    self.on_udp_read(data, addr)
+                    udp_ready = True
+            while tun_ready or udp_ready:
+                if tun_ready:
+                    try:
+                        ip_packet = os.read(self.tun, 65535)
+                    except BlockingIOError:
+                        tun_ready = False
+                    else:
+                        self.on_tun_read(ip_packet)
+                if udp_ready:
+                    try:
+                        data, addr = self.sock.recvfrom(65535)
+                    except BlockingIOError:
+                        udp_ready = False
+                    else:
+                        self.on_udp_read(data, addr)
+
             if time.time() - last_check_alive_time >= 1:
                 last_check_alive_time = time.time()
                 for peer in self.peers:
