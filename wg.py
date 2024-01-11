@@ -134,7 +134,9 @@ class WgTransportKeyPair:
         self.recv_cipher = ChaCha20Poly1305(recv_key)
         self.establish_time = establish_time
         self.is_initiator = is_initiator
-        self.count = 0
+        self.send_count = 0
+        self.max_recv_count = 0
+        self.recv_window = 0  # 32-bitmap as a rolling window for received packets
 
     def __str__(self):
         return f'keypair {self.number}'
@@ -143,13 +145,36 @@ class WgTransportKeyPair:
         padding_length = 16 - len(data) % 16
         if padding_length % 16 != 0:
             data += b'\x00' * padding_length
-        count_bytes = self.count.to_bytes(8, 'little')
+        count_bytes = self.send_count.to_bytes(8, 'little')
         encrypted = self.send_cipher.encrypt(b'\x00'*4 + count_bytes, data, b'')
         message = DataMessage(4, self.peer_id, count_bytes, encrypted)
-        self.count += 1
+        self.send_count += 1
         return message
 
     def decrypt_data(self, message: DataMessage) -> bytes | None:
+        count = int.from_bytes(message.counter, 'little')
+        # check if this packet is too old or has been received before, if so, discard it
+        # this rolling window algorithm is borrowed from  page 57 of https://www.rfc-editor.org/rfc/rfc2401.txt
+        diff = count - self.max_recv_count
+        if diff >= 32:
+            self.max_recv_count = count
+            self.recv_window = 1
+        elif diff > 0:
+            self.max_recv_count = count
+            # python int is unbounded, we have to keep it 32-bit wide
+            self.recv_window = (self.recv_window << diff) & 0xffffffff
+            self.recv_window |= 1   # set the bit for current count
+        else:
+            offset = -diff
+            if diff >= 32:
+                # this packet is too old, discard it
+                return None
+            mask = 1 << offset
+            if self.recv_window & mask != 0:
+                # this packet has been received before
+                return None
+            # mark this packet as received
+            self.recv_window |= mask
         try:
             return self.recv_cipher.decrypt(b'\x00'*4 + message.counter, message.encrypted, b'')
         except (InvalidKey, InvalidTag, InvalidSignature):
@@ -172,7 +197,7 @@ class WgPeer:
         self.prev_session: WgTransportKeyPair | None = None
         self.cur_session: WgTransportKeyPair | None = None
         self.handshake: WgHandshake | None = None
-        self.last_received_handshake_init_tai64n = 0
+        self.last_received_handshake_init_tai64n = b'\x00' * 12
         self.send_queue = queue.Queue()
         self.last_addr = None
         self.last_received_time = None
@@ -185,7 +210,7 @@ class WgPeer:
         if not cur:
             logger.info('no valid session yet, start new session')
             need_new_session = True
-        elif cur.count >= REJECT_AFTER_MESSAGES:
+        elif cur.send_count >= REJECT_AFTER_MESSAGES:
             logger.info('session expired for maximum messages, start new session')
             need_new_session = True
         elif cur.is_initiator and cur.establish_time + REKEY_AFTER_TIME < time.time():
@@ -205,23 +230,17 @@ class WgPeer:
             self.node.write_udp(data_msg, self.last_addr)
             self.last_send_time = time.time()
 
-    def decrypt_data(self, addr, message: DataMessage) -> bytes:
+    def decrypt_data(self, addr, message: DataMessage) -> bytes | None:
         self.expire_all_sessions_if_necessary()
         if not self.cur_session:
-            return b''
+            return None
         if message.receiver_index == self.cur_session.local_id:
             session = self.cur_session
         elif self.prev_session and message.receiver_index == self.prev_session.local_id:
             session = self.prev_session
         else:
-            return b''
-        try:
-            decrypted = session.decrypt_data(message)
-        except (InvalidKey, InvalidTag, InvalidSignature):
-            return b''
-        self.last_addr = addr
-        self.last_received_time = time.time()
-        return decrypted
+            return None
+        return session.decrypt_data(message)
 
     def expire_all_sessions_if_necessary(self):
         if self.cur_session and self.cur_session.establish_time + REJECT_AFTER_TIME * 3 < time.time():
@@ -390,6 +409,8 @@ class WgNode:
             message = DataMessage._make(struct.unpack(message_format, data))
             if peer := self.get_peer(session_id=message.receiver_index):
                 if decrypted := peer.decrypt_data(addr, message):
+                    peer.last_addr = addr
+                    peer.last_received_time = time.time()
                     os.write(self.tun, decrypted)
 
     def init_handshake(self, sr_pub: bytes) -> WgHandshake:
@@ -439,7 +460,7 @@ class WgNode:
         req = HandshakeInit(1, sender_index, ei_pub, encrypted_static, encrypted_timestamp, mac1, mac2)
         return WgHandshake(req, on_response)
 
-    def respond_to_handshake(self, msg: HandshakeInit) -> tuple[bytes, int, WgTransportKeyPair, HandshakeResponse]:
+    def respond_to_handshake(self, msg: HandshakeInit) -> tuple[bytes, bytes, WgTransportKeyPair, HandshakeResponse]:
         """called by responder: compose response message and generate keypair.
 
         :param sr_priv: responder's private key
@@ -483,7 +504,7 @@ class WgNode:
         keypair = WgTransportKeyPair(local_id=sender_index, peer_id=receiver_index,
                                      send_key=send_key, recv_key=recv_key,
                                      establish_time=time.time(), is_initiator=False)
-        return si_pub, int.from_bytes(timestamp, 'big'), keypair,\
+        return si_pub, timestamp, keypair,\
             HandshakeResponse(2, sender_index, receiver_index, unencrypted_ephemeral,encrypted_nothing, mac1, mac2)
 
     def write_udp(self, message: HandshakeInit | HandshakeResponse | DataMessage, addr: tuple[str, int]):
