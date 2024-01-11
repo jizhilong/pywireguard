@@ -275,6 +275,7 @@ class WgNode:
         self.listen_ip, self.listen_port = listen_ip, listen_port
         self.tun = None
         self.sock: socket.socket = None
+        self.sock_write_queue: list[tuple[bytes, tuple[str, int]]] = []
         self.private = private
         self.public = public
         self.mac1_auth = hash(LABEL_MAC1 + self.public)
@@ -306,7 +307,6 @@ class WgNode:
     def _setup_udp_sock(self):
         self.sock: socket.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((self.listen_ip, self.listen_port))
-        self.sock.setblocking(False)
 
     def _setup_tun_dev(self):
         """create a linux tun device and return it"""
@@ -320,10 +320,11 @@ class WgNode:
         subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
         for peer in self.peers:
             subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
-        os.set_blocking(tun, False)
         self.tun = tun
 
     def _setup_selector(self):
+        os.set_blocking(self.tun, False)
+        self.sock.setblocking(False)
         selector = selectors.DefaultSelector()
         selector.register(self.sock, selectors.EVENT_READ)
         selector.register(self.tun, selectors.EVENT_READ)
@@ -342,7 +343,7 @@ class WgNode:
                     tun_ready = True
                 elif key.fd == self.sock.fileno():
                     udp_ready = True
-            while tun_ready or udp_ready:
+            while tun_ready or udp_ready or self.sock_write_queue:
                 if tun_ready:
                     try:
                         ip_packet = os.read(self.tun, 65535)
@@ -357,6 +358,13 @@ class WgNode:
                         udp_ready = False
                     else:
                         self.on_udp_read(data, addr)
+                if self.sock_write_queue:
+                    data, addr = self.sock_write_queue[0]
+                    try:
+                        self.sock.sendto(data, addr)
+                        self.sock_write_queue.pop(0)
+                    except BlockingIOError:
+                        pass
 
             if time.time() - last_check_alive_time >= 1:
                 last_check_alive_time = time.time()
@@ -534,7 +542,7 @@ class WgNode:
         else:
             message_format = data_message_header_format + f'{len(message.encrypted)}s'
         data = struct.pack(message_format, *message)
-        self.sock.sendto(data, addr)
+        self.sock_write_queue.append((data, addr))
 
     def get_peer(self, ip: str | None = None, peer_public: bytes | None = None,
                  handshake_session_id: bytes | None = None, session_id: bytes | None = None) -> WgPeer | None:
