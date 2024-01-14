@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import queue
-import select
 import selectors
 import socket
 import struct
@@ -143,11 +142,12 @@ class WgTransportKeyPair:
         return f'keypair {self.number}'
 
     def encrypt_data(self, data: bytes) -> DataMessage:
-        padding_length = 16 - len(data) % 16
-        if padding_length % 16 != 0:
-            data += b'\x00' * padding_length
+        remainder = len(data) % 16
+        if remainder != 0:
+            data += b'\x00' * (16 - remainder)
         count_bytes = self.send_count.to_bytes(8, 'little')
-        encrypted = self.send_cipher.encrypt(b'\x00'*4 + count_bytes, data, b'')
+        nonce = (self.send_count << 32).to_bytes(12, 'little')
+        encrypted = self.send_cipher.encrypt(nonce, data, b'')
         message = DataMessage(4, self.peer_id, count_bytes, encrypted)
         self.send_count += 1
         return message
@@ -177,7 +177,8 @@ class WgTransportKeyPair:
             # mark this packet as received
             self.recv_window |= mask
         try:
-            return self.recv_cipher.decrypt(b'\x00'*4 + message.counter, message.encrypted, b'')
+            nonce = (count << 32).to_bytes(12, 'little')
+            return self.recv_cipher.decrypt(nonce, message.encrypted, b'')
         except (InvalidKey, InvalidTag, InvalidSignature):
             return None
 
