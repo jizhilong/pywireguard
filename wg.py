@@ -310,7 +310,7 @@ class WgNode:
                 if pre_shared_key:
                     psk = base64.b64decode(pre_shared_key)
                 else:
-                    psk = '\x00' * 32
+                    psk = b'\x00' * 32
                 peers.append(WgPeer(peer_ip, peer_endpoint, peer_public, node=node, psk=psk))
             return node
 
