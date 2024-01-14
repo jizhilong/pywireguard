@@ -236,7 +236,7 @@ class WgPeer:
             self.node.write_udp(data_msg, self.last_addr)
             self.last_send_time = time.time()
 
-    def decrypt_data(self, addr, message: DataMessage) -> bytes | None:
+    def decrypt_data(self, message: DataMessage) -> bytes | None:
         self.expire_all_sessions_if_necessary()
         if not self.cur_session:
             return None
@@ -431,7 +431,7 @@ class WgNode:
             message_format = data_message_header_format + f'{len(data) - 16}s'
             message = DataMessage._make(struct.unpack(message_format, data))
             if peer := self.get_peer(session_id=message.receiver_index):
-                if decrypted := peer.decrypt_data(addr, message):
+                if decrypted := peer.decrypt_data(message):
                     peer.last_addr = addr
                     peer.last_received_time = time.time()
                     os.write(self.tun, decrypted)

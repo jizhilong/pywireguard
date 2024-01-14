@@ -1,4 +1,3 @@
-import os
 import random
 import threading
 import timeit
@@ -7,7 +6,6 @@ import pytest as pytest
 from scapy.layers.inet import raw, IP
 
 from wg import *
-
 
 psk = os.urandom(32)
 
@@ -95,9 +93,9 @@ def test_integrate(wg1, wg2):
 
 
 def test_left_padding_int():
-    l = random.randint(0, 2**64)
-    left_padding_1 = b'\x00' * 4 + int.to_bytes(l, 8, 'little')
-    left_padding_2 = (l << 32).to_bytes(12, 'little')
+    rand_int = random.randint(0, 2**64)
+    left_padding_1 = b'\x00' * 4 + int.to_bytes(rand_int, 8, 'little')
+    left_padding_2 = (rand_int << 32).to_bytes(12, 'little')
     assert left_padding_1 == left_padding_2
 
 
