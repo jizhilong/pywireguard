@@ -112,3 +112,19 @@ def test_bench_encrypt_decrypt():
                             globals=locals(), number=loop_count)
     rate = (len(plain) * loop_count) / elapsed / 2**20
     print(f'encrypt/decrypt {loop_count} times takes {elapsed} seconds, {rate} MiB/s')
+
+
+def test_data_replay_check():
+    key1, key2 = os.urandom(32), os.urandom(32)
+    send_keypair = WgTransportKeyPair(local_id=b'\x00'*4, peer_id=b'\x00'*4,
+                                      send_key=key1, recv_key=key2, establish_time=time.time(), is_initiator=True)
+    recv_keypair = WgTransportKeyPair(local_id=b'\x00'*4, peer_id=b'\x00'*4,
+                                      send_key=key2, recv_key=key1, establish_time=time.time(), is_initiator=False)
+
+    plain = b'h' * 1488
+    encrypted = [send_keypair.encrypt_data(plain) for i in range(32)]
+    random.shuffle(encrypted)
+    for msg in encrypted:
+        assert recv_keypair.decrypt_data(msg) == plain
+    for msg in encrypted:
+        assert recv_keypair.decrypt_data(msg) is None
