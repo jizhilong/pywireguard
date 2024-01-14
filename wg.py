@@ -111,6 +111,9 @@ def tai64n(now: float) -> bytes:
     return seconds.to_bytes(8, 'big') + nanoseconds.to_bytes(4, 'big')
 
 
+# utility to serialize/deserialize wireguard messages(handshake init/handshake response/data)
+# xx_format are for struct.pack/unpack
+# HandshakeInit/HandshakeResponse/DataMessage are namedtuples for ease of message manipulating
 handshake_init_prefix_format = '<I4s32s48s28s'
 handshake_init_message_format = handshake_init_prefix_format + '16s16s'
 HandshakeInit = namedtuple('HandShakeInit', 'type sender_index unencrypted_ephemeral encrypted_static encrypted_timestamp mac1 mac2')   # noqa
@@ -191,11 +194,12 @@ class WgHandshake:
 
 
 class WgPeer:
-    def __init__(self, ip: str, endpoint: tuple[str, int], public: bytes, node: 'WgNode'):
+    def __init__(self, ip: str, endpoint: tuple[str, int], public: bytes, node: 'WgNode', psk: bytes):
         self.ip = ip
         self.endpoint = endpoint
         self.public = public
         self.node = node
+        self.psk = psk
         self.prev_session: WgTransportKeyPair | None = None
         self.cur_session: WgTransportKeyPair | None = None
         self.handshake: WgHandshake | None = None
@@ -223,7 +227,7 @@ class WgPeer:
             self.send_queue.put(data)
             if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
                 return
-            handshake = self.node.init_handshake(self.public)
+            handshake = self.node.init_handshake(self)
             addr = self.last_addr or self.endpoint
             self.node.write_udp(handshake.req, addr)
             self.handshake = handshake
@@ -302,7 +306,12 @@ class WgNode:
                     peer_endpoint = (ip, int(port))
                 else:
                     peer_endpoint = ('', 0)
-                peers.append(WgPeer(peer_ip, peer_endpoint, peer_public, node=node))
+                pre_shared_key = peer.get('pre_shared_key')
+                if pre_shared_key:
+                    psk = base64.b64decode(pre_shared_key)
+                else:
+                    psk = '\x00' * 32
+                peers.append(WgPeer(peer_ip, peer_endpoint, peer_public, node=node, psk=psk))
             return node
 
     def _setup_udp_sock(self):
@@ -400,23 +409,9 @@ class WgNode:
                 logger.warning('invalid mac1 of handshake init from %s', addr)
                 return
             try:
-                peer_public, timestamp, keypair, response = self.respond_to_handshake(message)
-            except (InvalidKey, InvalidTag, InvalidSignature, AssertionError):
+                self.respond_to_handshake(addr, message)
+            except (InvalidKey, InvalidTag, InvalidSignature):
                 logger.warning('invalid handshake init from %s', addr)
-                return
-            if peer := self.get_peer(peer_public=peer_public):
-                if peer.last_received_handshake_init_tai64n >= timestamp:
-                    logger.warning('handshake init from %s is replayed', addr)
-                    return
-                if peer.cur_session and time.time() - peer.cur_session.establish_time < MIN_HANDSHAKE_INTERVAL:
-                    logger.warning('handshake init from %s is too frequent', addr)
-                    return
-                self.write_udp(response, addr)
-                peer.last_addr = addr
-                peer.last_received_handshake_init_tai64n = timestamp
-                peer.set_cur_session(keypair)
-            else:
-                logger.warning('handshake init from %s have no corresponding peer', addr)
         elif msg_type == 2:
             message = HandshakeResponse._make(struct.unpack(handshake_response_message_format, data))
             if message.mac1 != mac(self.mac1_auth, data[:60]):
@@ -441,13 +436,13 @@ class WgNode:
                     peer.last_received_time = time.time()
                     os.write(self.tun, decrypted)
 
-    def init_handshake(self, sr_pub: bytes) -> WgHandshake:
+    def init_handshake(self, peer: WgPeer) -> WgHandshake:
         """called by initiator: initiate a wireguard handshake with responder's public key.
 
-        :param sr_pub: responder's public key
+        :param peer: responder
         :return: (handshake init message to be read by responder, callback to process response from responder)
         """
-        si_priv, si_pub = self.private, self.public
+        si_priv, si_pub, sr_pub = self.private, self.public, peer.public
 
         ck = hash(CONSTRUCTION)
         h = hash(ck + IDENTIFIER)
@@ -476,7 +471,7 @@ class WgNode:
             h = hash(h + er_pub)
             ck = kdf1(ck, dh(ei_priv, er_pub))
             ck = kdf1(ck, dh(si_priv, er_pub))
-            ck, tao, key_nothing = kdf3(ck, b'\x00'*32)
+            ck, tao, key_nothing = kdf3(ck, peer.psk)
             h = hash(h + tao)
             nothing = decrypt_aead(key_nothing, 0, resp.encrypted_nothing, h)
             assert nothing == b''
@@ -488,13 +483,11 @@ class WgNode:
         req = HandshakeInit(1, sender_index, ei_pub, encrypted_static, encrypted_timestamp, mac1, mac2)
         return WgHandshake(req, on_response)
 
-    def respond_to_handshake(self, msg: HandshakeInit) -> tuple[bytes, bytes, WgTransportKeyPair, HandshakeResponse]:
+    def respond_to_handshake(self, addr: tuple[str, int], msg: HandshakeInit):
         """called by responder: compose response message and generate keypair.
 
-        :param sr_priv: responder's private key
-        :param sr_pub: responder's public key
+        :param addr: from which address is msg sent from
         :param msg: handshake init message
-        :return: e 3-tuple: (si_pub, keypair, handshake response message)
         """
         sr_priv, sr_pub = self.private, self.public
 
@@ -507,17 +500,28 @@ class WgNode:
         h = hash(h + ei_pub)
         ck, k = kdf2(ck, dh(sr_priv, ei_pub))
         si_pub = decrypt_aead(k, 0, msg.encrypted_static, h)
+        peer = self.get_peer(peer_public=si_pub)
+
+        if not peer:
+            logger.warning('handshake init from %s have no corresponding peer', addr)
+            return
+        if peer.cur_session and time.time() - peer.cur_session.establish_time < MIN_HANDSHAKE_INTERVAL:
+            logger.warning('handshake init from %s is too frequent', addr)
+            return
+
         h = hash(h + msg.encrypted_static)
         ck, k = kdf2(ck, dh(sr_priv, si_pub))
         timestamp = decrypt_aead(k, 0, msg.encrypted_timestamp, h)
+        if peer.last_received_handshake_init_tai64n >= timestamp:
+            logger.warning('handshake init from %s is replayed', addr)
+            return
 
         h = hash(h + msg.encrypted_timestamp)
-
         ck = kdf1(ck, er_pub)
         h = hash(h + er_pub)
         ck = kdf1(ck, dh(er_priv, ei_pub))
         ck = kdf1(ck, dh(er_priv, si_pub))
-        ck, tao, k = kdf3(ck, b'\x00'*32)
+        ck, tao, k = kdf3(ck, peer.psk)
         h = hash(h + tao)
         encrypted_nothing = aead(k, 0, b'', h)
         recv_key, send_key = kdf2(ck, b'')
@@ -532,8 +536,12 @@ class WgNode:
         keypair = WgTransportKeyPair(local_id=sender_index, peer_id=receiver_index,
                                      send_key=send_key, recv_key=recv_key,
                                      establish_time=time.time(), is_initiator=False)
-        return si_pub, timestamp, keypair,\
-            HandshakeResponse(2, sender_index, receiver_index, unencrypted_ephemeral,encrypted_nothing, mac1, mac2)
+        response = HandshakeResponse(2, sender_index, receiver_index, unencrypted_ephemeral,
+                                     encrypted_nothing, mac1, mac2)
+        self.write_udp(response, addr)
+        peer.last_addr = addr
+        peer.last_received_handshake_init_tai64n = timestamp
+        peer.set_cur_session(keypair)
 
     def write_udp(self, message: HandshakeInit | HandshakeResponse | DataMessage, addr: tuple[str, int]):
         if isinstance(message, HandshakeInit):

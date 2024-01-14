@@ -1,3 +1,4 @@
+import os
 import random
 import threading
 import timeit
@@ -6,6 +7,9 @@ import pytest as pytest
 from scapy.layers.inet import raw, IP
 
 from wg import *
+
+
+psk = os.urandom(32)
 
 
 @pytest.fixture
@@ -38,7 +42,7 @@ def wg1(wg_keys, wg_ports):
     (port_1, port_2) = wg_ports
     node = WgNode(ip='10.0.0.1', listen_ip='127.0.0.1', listen_port=port_1,
                   private=private_1, public=public_1, peers=[])
-    node.peers.append(WgPeer('10.0.0.2', ('127.0.0.1', port_2), public_2, node))
+    node.peers.append(WgPeer('10.0.0.2', ('127.0.0.1', port_2), public_2, node, psk))
     s1, s2 = socket.socketpair(type=socket.SOCK_DGRAM)
     node.tun = s1.fileno()
     node._tun = s1
@@ -52,7 +56,7 @@ def wg2(wg_keys, wg_ports):
     (port_1, port_2) = wg_ports
     node = WgNode(ip='10.0.0.2', listen_ip='127.0.0.1', listen_port=port_2,
                   private=private_2, public=public_2, peers=[])
-    node.peers.append(WgPeer('10.0.0.1', ('127.0.0.1', port_1), public_1, node))
+    node.peers.append(WgPeer('10.0.0.1', ('127.0.0.1', port_1), public_1, node, psk))
     s1, s2 = socket.socketpair(type=socket.SOCK_DGRAM)
     node.tun = s1.fileno()
     node._tun = s1
@@ -88,14 +92,6 @@ def test_integrate(wg1, wg2):
     assert wg2.peers[0].cur_session.max_recv_count == 0
     assert wg1.peers[0].cur_session.recv_window == 1
     assert wg2.peers[0].cur_session.recv_window == 1
-
-
-def test_handshake(wg1, wg2):
-    handshake = wg1.init_handshake(wg2.public)
-    si_pub, timestamp, r_pair, resp_msg = wg2.respond_to_handshake(handshake.req)
-    i_pair = handshake.on_response(resp_msg)
-    assert r_pair.decrypt_data(i_pair.encrypt_data(b'h'*16)) == b'h'*16
-    assert si_pub == wg1.public
 
 
 def test_left_padding_int():
