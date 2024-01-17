@@ -196,6 +196,7 @@ class WgHandshake:
 class WgPeer:
     def __init__(self, ip: str, endpoint: tuple[str, int], public: bytes, node: 'WgNode', psk: bytes):
         self.ip = ip
+        self.ip_bytes = socket.inet_aton(ip)  # for fast comparison with dst address in ip packet
         self.endpoint = endpoint
         self.public = public
         self.node = node
@@ -394,7 +395,7 @@ class WgNode:
         version = ip_packet[0] >> 4
         if version != 4:
             return
-        dst_addr = socket.inet_ntoa(ip_packet[16:20])
+        dst_addr = ip_packet[16:20]
         if peer := self.get_peer(ip=dst_addr):
             peer.send_data(ip_packet)
 
@@ -553,10 +554,10 @@ class WgNode:
         data = struct.pack(message_format, *message)
         self.sock_write_queue.append((data, addr))
 
-    def get_peer(self, ip: str | None = None, peer_public: bytes | None = None,
+    def get_peer(self, ip: bytes | None = None, peer_public: bytes | None = None,
                  handshake_session_id: bytes | None = None, session_id: bytes | None = None) -> WgPeer | None:
         for peer in self.peers:
-            if peer.ip == ip or peer.public == peer_public:
+            if peer.ip_bytes == ip or peer.public == peer_public:
                 return peer
             if session_id:
                 if peer.cur_session and peer.cur_session.local_id == session_id:
