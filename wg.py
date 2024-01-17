@@ -19,8 +19,28 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.hmac import HMAC
+from cryptography.hazmat.backends.openssl import aead, backend
 
 logger = logging.getLogger('wg')
+
+
+class ChaCha20Poly1305Unsafe:
+    """ChaCha20Poly1305 mod for single thread usage, not safe to work in multi-thread environment."""
+    def __init__(self, key: bytes):
+        self.cipher = ChaCha20Poly1305(key)
+        self.ctx = aead._aead_create_ctx(backend, self.cipher, key)
+        if aead._is_evp_aead_supported_cipher(backend, self.cipher):
+            self._encrypt = aead._evp_aead_encrypt
+            self._decrypt = aead._evp_aead_decrypt
+        else:
+            self._encrypt = aead._evp_cipher_encrypt
+            self._decrypt = aead._evp_cipher_decrypt
+
+    def encrypt(self, nonce: bytes, data: bytes, auth: bytes) -> bytes:
+        return self._encrypt(backend, self.cipher, nonce, data, [auth], 16, self.ctx)
+
+    def decrypt(self, nonce: bytes, data: bytes, auth: bytes) -> bytes:
+        return self._decrypt(backend, self.cipher, nonce, data, [auth], 16, self.ctx)
 
 
 def dh(private_key: bytes, public_key: bytes) -> bytes:
@@ -37,18 +57,6 @@ def dh_generate() -> tuple[bytes, bytes]:
     private = X25519PrivateKey.generate()
     public = private.public_key()
     return private.private_bytes_raw(), public.public_bytes_raw()
-
-
-def aead(key: bytes, counter: int, plain: bytes, auth: bytes) -> bytes:
-    chacha = ChaCha20Poly1305(key=key)
-    nounce = b'\x00' * 4 + counter.to_bytes(8, 'little')
-    return chacha.encrypt(nounce, data=plain, associated_data=auth)
-
-
-def decrypt_aead(key: bytes, counter: int, encrypted: bytes, auth: bytes) -> bytes:
-    chacha = ChaCha20Poly1305(key=key)
-    nounce = b'\x00' * 4 + counter.to_bytes(8, 'little')
-    return chacha.decrypt(nounce, data=encrypted, associated_data=auth)
 
 
 def hmac(key: bytes, input_: bytes) -> bytes:
@@ -102,6 +110,7 @@ REKEY_ATTEMPT_TIME = 90
 REKEY_TIMEOUT = 5
 KEEPALIVE_TIMEOUT = 10
 MIN_HANDSHAKE_INTERVAL = 0.05   # 50ms
+EMPTY_NONCE = b'\x00' * 12
 
 
 def tai64n(now: float) -> bytes:
@@ -133,8 +142,8 @@ class WgTransportKeyPair:
         self.number = WgTransportKeyPair.key_pair_count
         self.local_id = local_id
         self.peer_id = peer_id
-        self.send_cipher = ChaCha20Poly1305(send_key)
-        self.recv_cipher = ChaCha20Poly1305(recv_key)
+        self.send_cipher = ChaCha20Poly1305Unsafe(send_key)
+        self.recv_cipher = ChaCha20Poly1305Unsafe(recv_key)
         self.establish_time = establish_time
         self.is_initiator = is_initiator
         self.send_count = 0
@@ -452,10 +461,10 @@ class WgNode:
         ck = kdf1(ck, ei_pub)
         h = hash(h + ei_pub)
         ck, k = kdf2(ck, dh(ei_priv, sr_pub))
-        encrypted_static = aead(k, 0, si_pub, h)
+        encrypted_static = ChaCha20Poly1305Unsafe(k).encrypt(EMPTY_NONCE, si_pub, h)
         h = hash(h + encrypted_static)
         ck, k = kdf2(ck, dh(si_priv, sr_pub))
-        encrypted_timestamp = aead(k, 0, tai64n(time.time()), h)
+        encrypted_timestamp = ChaCha20Poly1305Unsafe(k).encrypt(EMPTY_NONCE, tai64n(time.time()), h)
         h = hash(h + encrypted_timestamp)
 
         sender_index = os.urandom(4)
@@ -474,7 +483,7 @@ class WgNode:
             ck = kdf1(ck, dh(si_priv, er_pub))
             ck, tao, key_nothing = kdf3(ck, peer.psk)
             h = hash(h + tao)
-            nothing = decrypt_aead(key_nothing, 0, resp.encrypted_nothing, h)
+            nothing = ChaCha20Poly1305Unsafe(key_nothing).decrypt(EMPTY_NONCE, resp.encrypted_nothing, h)
             assert nothing == b''
             send_key, recv_key = kdf2(ck, b'')
             return WgTransportKeyPair(local_id=sender_index, peer_id=resp.sender_index,
@@ -500,7 +509,7 @@ class WgNode:
         ck = kdf1(ck, ei_pub)
         h = hash(h + ei_pub)
         ck, k = kdf2(ck, dh(sr_priv, ei_pub))
-        si_pub = decrypt_aead(k, 0, msg.encrypted_static, h)
+        si_pub = ChaCha20Poly1305Unsafe(k).decrypt(EMPTY_NONCE, msg.encrypted_static, h)
         peer = self.get_peer(peer_public=si_pub)
 
         if not peer:
@@ -512,7 +521,7 @@ class WgNode:
 
         h = hash(h + msg.encrypted_static)
         ck, k = kdf2(ck, dh(sr_priv, si_pub))
-        timestamp = decrypt_aead(k, 0, msg.encrypted_timestamp, h)
+        timestamp = ChaCha20Poly1305Unsafe(k).decrypt(EMPTY_NONCE, msg.encrypted_timestamp, h)
         if peer.last_received_handshake_init_tai64n >= timestamp:
             logger.warning('handshake init from %s is replayed', addr)
             return
@@ -524,7 +533,7 @@ class WgNode:
         ck = kdf1(ck, dh(er_priv, si_pub))
         ck, tao, k = kdf3(ck, peer.psk)
         h = hash(h + tao)
-        encrypted_nothing = aead(k, 0, b'', h)
+        encrypted_nothing = ChaCha20Poly1305Unsafe(k).encrypt(EMPTY_NONCE, b'', h)
         recv_key, send_key = kdf2(ck, b'')
 
         encrypted_nothing = encrypted_nothing
