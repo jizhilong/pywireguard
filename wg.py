@@ -8,9 +8,10 @@ import selectors
 import socket
 import struct
 import subprocess
+import sys
 import time
 from collections import namedtuple
-from ctypes import Structure, c_char, c_short
+from ctypes import Structure, c_char, c_short, c_int
 from fcntl import ioctl
 from typing import Callable
 
@@ -279,10 +280,18 @@ TUNSETOWNER = TUNSETIFF + 2
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000
 
+# for macos
+CTLIOCGINFO = 0xc0644e03
+
 
 class IfReq(Structure):
     _fields_ = [("name", c_char * 16), ("flags", c_short)]
 
+class CtlInfo(Structure):
+    _fields_ = [
+        ("ctl_id", c_int),
+        ("ctl_name", c_char * 96)
+    ]
 
 class WgNode:
     def __init__(self, ip: str, listen_ip: str, listen_port: int, private: bytes, public: bytes, peers: list[WgPeer]):
@@ -330,17 +339,33 @@ class WgNode:
 
     def _setup_tun_dev(self):
         """create a linux tun device and return it"""
-        tun = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
-        # struct.pack an instance of ifreq with setting ifrn_name
-        req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
-        ioctl(tun, TUNSETIFF, req)
-        ioctl(tun, TUNSETOWNER, os.getuid())
-        ifname = req.name.decode()
-        subprocess.check_call(f'ip addr add {self.ip} dev {ifname}', shell=True)
-        subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
-        for peer in self.peers:
-            subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
-        self.tun = tun
+        if sys.platform == 'linux':
+            tun = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
+            # struct.pack an instance of ifreq with setting ifrn_name
+            req = IfReq(name='testun%d'.encode(), flags=IFF_TUN | IFF_NO_PI)
+            ioctl(tun, TUNSETIFF, req)
+            ioctl(tun, TUNSETOWNER, os.getuid())
+            ifname = req.name.decode()
+            subprocess.check_call(f'ip addr add {self.ip}/24 dev {ifname}', shell=True)
+            subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
+            for peer in self.peers:
+                subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
+            self.tun = tun
+        elif sys.platform == 'darwin':
+            sock = socket.socket(socket.AF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
+            ctl_info = CtlInfo()
+            ctl_info.ctl_id = 0
+            ctl_info.ctl_name = b"com.apple.net.utun_control"
+            ioctl(sock.fileno(), CTLIOCGINFO, ctl_info)
+            sock.connect((ctl_info.ctl_id, 0))
+            interface_name = sock.getsockopt(socket.SYSPROTO_CONTROL, 2, 16).rstrip(b'\x00').decode()
+            subprocess.check_call(f'ifconfig {interface_name} inet {self.ip}/24 {self.ip} alias up', shell=True)
+            for peer in self.peers:
+                subprocess.check_call(f'route -n add -net {peer.ip} {self.ip}', shell=True)
+            self.tun = sock.fileno()
+            self.tun_sock = sock
+        else:
+            raise NotImplementedError(f'platform {sys.platform} not supported')
 
     def _setup_selector(self):
         os.set_blocking(self.tun, False)
@@ -400,6 +425,8 @@ class WgNode:
         # check if data is a valid ip packet
         if len(ip_packet) < 20:
             return
+        if sys.platform == 'darwin':
+            ip_packet = ip_packet[4:]
         # support ipv4 only for now
         version = ip_packet[0] >> 4
         if version != 4:
@@ -444,7 +471,10 @@ class WgNode:
                 if decrypted := peer.decrypt_data(message):
                     peer.last_addr = addr
                     peer.last_received_time = time.time()
-                    os.write(self.tun, decrypted)
+                    if sys.platform == 'darwin':
+                        os.write(self.tun, b'\x00\x00\x00\x02' + decrypted)
+                    else:
+                        os.write(self.tun, decrypted)
 
     def init_handshake(self, peer: WgPeer) -> WgHandshake:
         """called by initiator: initiate a wireguard handshake with responder's public key.

@@ -1,11 +1,14 @@
 # pywireguard
-A [wireguard](https://www.wireguard.com/) implementation in python. **for educational purpose only.**
+A [wireguard](https://www.wireguard.com/) implementation in python, works on Linux and macOS.
 
 ## quickstart
-This implementation only works on linux for now, wireguard kernel module is not required.
 ```bash
 $ git clone git@github.com:jizhilong/pywireguard.git
 $ cd pywireguard
 $ pip install -r requirements.txt
 $ sudo python3 wg.py
 ```
+
+## references
+- [wireguard protocol introduction](https://www.wireguard.com/protocol/)
+- [wireguard whitepaper](https://www.wireguard.com/papers/wireguard.pdf)
