@@ -309,7 +309,7 @@ class LinuxTunReaderWriter:
         return self.buf[:n+padding_size]
 
     def write(self, data: bytes):
-        self.io.write(data)
+        os.write(self.fd, data)
 
 
 class DarwinTunReaderWriter:

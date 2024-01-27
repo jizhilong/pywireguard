@@ -42,8 +42,8 @@ def wg1(wg_keys, wg_ports):
                   private=private_1, public=public_1, peers=[])
     node.peers.append(WgPeer('10.0.0.2', ('127.0.0.1', port_2), public_2, node, psk))
     s1, s2 = socket.socketpair(type=socket.SOCK_DGRAM)
-    node.tun = s1.fileno()
-    node._tun = s1
+    node.tun = LinuxTunReaderWriter(s1.fileno())
+    node._tun = s1   # prevent socket object from being garbage collected
     node.tunw= s2
     return node
 
@@ -56,8 +56,8 @@ def wg2(wg_keys, wg_ports):
                   private=private_2, public=public_2, peers=[])
     node.peers.append(WgPeer('10.0.0.1', ('127.0.0.1', port_1), public_1, node, psk))
     s1, s2 = socket.socketpair(type=socket.SOCK_DGRAM)
-    node.tun = s1.fileno()
-    node._tun = s1
+    node.tun = LinuxTunReaderWriter(s1.fileno())
+    node._tun = s1   # prevent socket object from being garbage collected
     node.tunw= s2
     return node
 
