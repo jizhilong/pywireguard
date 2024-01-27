@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import logging
 import os
@@ -154,10 +155,7 @@ class WgTransportKeyPair:
     def __str__(self):
         return f'keypair {self.number}'
 
-    def encrypt_data(self, data: bytes) -> DataMessage:
-        remainder = len(data) % 16
-        if remainder != 0:
-            data += b'\x00' * (16 - remainder)
+    def encrypt_data(self, data: bytes | memoryview) -> DataMessage:
         count_bytes = self.send_count.to_bytes(8, 'little')
         nonce = (self.send_count << 32).to_bytes(12, 'little')
         encrypted = self.send_cipher.encrypt(nonce, data, b'')
@@ -220,7 +218,7 @@ class WgPeer:
         self.last_received_time = None
         self.last_send_time = time.time()
 
-    def send_data(self, data: bytes):
+    def send_data(self, data: bytes | memoryview):
         self.expire_all_sessions_if_necessary()
         need_new_session = False
         cur = self.cur_session
@@ -235,7 +233,7 @@ class WgPeer:
             need_new_session = True
 
         if need_new_session:
-            self.send_queue.put(data)
+            self.send_queue.put(bytes(data))
             if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
                 return
             handshake = self.node.init_handshake(self)
@@ -287,11 +285,54 @@ CTLIOCGINFO = 0xc0644e03
 class IfReq(Structure):
     _fields_ = [("name", c_char * 16), ("flags", c_short)]
 
+
 class CtlInfo(Structure):
     _fields_ = [
         ("ctl_id", c_int),
         ("ctl_name", c_char * 96)
     ]
+
+
+class LinuxTunReaderWriter:
+    def __init__(self, fd: int):
+        self.fd = fd
+        self.buf = memoryview(bytearray(65535))
+
+    def fileno(self):
+        return self.fd
+
+    def read(self):
+        n = os.readv(self.fd, [self.buf])
+        padding_size = 0
+        if n % 16 != 0:
+            padding_size = 16 - n % 16    # padding for ChaCha20Poly1305 encryption
+        return self.buf[:n+padding_size]
+
+    def write(self, data: bytes):
+        self.io.write(data)
+
+
+class DarwinTunReaderWriter:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.fd = sock.fileno()
+        self.buf = memoryview(bytearray(65535))
+
+    def fileno(self):
+        return self.fd
+
+    def read(self):
+        n = os.readv(self.fd, [self.buf])
+        ip_packet_size = n - 4  # darwin has no IFF_NO_PI, so we have to strip the 4-byte header
+        padding_size = 0
+        if ip_packet_size % 16 != 0:
+            padding_size = 16 - ip_packet_size % 16 # padding for ChaCha20Poly1305 encryption
+        return self.buf[4:n+padding_size]
+
+    def write(self, data: bytes):
+        header = b'\x00\x00\x00\x02'  # darwin has no IFF_NO_PI, so we have to insert the 4-byte header
+        os.writev(self.fd, [header, data])
+
 
 class WgNode:
     def __init__(self, ip: str, listen_ip: str, listen_port: int, private: bytes, public: bytes, peers: list[WgPeer]):
@@ -350,7 +391,7 @@ class WgNode:
             subprocess.check_call(f'ip link set dev {ifname} up ', shell=True)
             for peer in self.peers:
                 subprocess.check_call(f'ip route add {peer.ip} via {self.ip}', shell=True)
-            self.tun = tun
+            self.tun = LinuxTunReaderWriter(tun)
         elif sys.platform == 'darwin':
             sock = socket.socket(socket.AF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL)
             ctl_info = CtlInfo()
@@ -362,13 +403,12 @@ class WgNode:
             subprocess.check_call(f'ifconfig {interface_name} inet {self.ip}/24 {self.ip} alias up', shell=True)
             for peer in self.peers:
                 subprocess.check_call(f'route -n add -net {peer.ip} {self.ip}', shell=True)
-            self.tun = sock.fileno()
-            self.tun_sock = sock
+            self.tun = DarwinTunReaderWriter(sock)
         else:
             raise NotImplementedError(f'platform {sys.platform} not supported')
 
     def _setup_selector(self):
-        os.set_blocking(self.tun, False)
+        os.set_blocking(self.tun.fileno(), False)
         self.sock.setblocking(False)
         selector = selectors.DefaultSelector()
         selector.register(self.sock, selectors.EVENT_READ)
@@ -384,14 +424,14 @@ class WgNode:
             events = selector.select(1)
             udp_ready = tun_ready = False
             for key, mask in events:
-                if key.fd == self.tun:
+                if key.fileobj is self.tun:
                     tun_ready = True
-                elif key.fd == self.sock.fileno():
+                elif key.fileobj is self.sock:
                     udp_ready = True
             while tun_ready or udp_ready or self.sock_write_queue:
                 if tun_ready:
                     try:
-                        ip_packet = os.read(self.tun, 65535)
+                        ip_packet = self.tun.read()
                     except BlockingIOError:
                         tun_ready = False
                     else:
@@ -420,13 +460,11 @@ class WgNode:
                         logger.info(f'sending keepalive to {peer.ip}')
                         peer.send_data(b'')
 
-    def on_tun_read(self, ip_packet: bytes):
+    def on_tun_read(self, ip_packet: bytes | memoryview):
         """called when data read from tun(aka. ip packets to encapsulate in udp)"""
         # check if data is a valid ip packet
         if len(ip_packet) < 20:
             return
-        if sys.platform == 'darwin':
-            ip_packet = ip_packet[4:]
         # support ipv4 only for now
         version = ip_packet[0] >> 4
         if version != 4:
@@ -471,10 +509,7 @@ class WgNode:
                 if decrypted := peer.decrypt_data(message):
                     peer.last_addr = addr
                     peer.last_received_time = time.time()
-                    if sys.platform == 'darwin':
-                        os.write(self.tun, b'\x00\x00\x00\x02' + decrypted)
-                    else:
-                        os.write(self.tun, decrypted)
+                    self.tun.write(decrypted)
 
     def init_handshake(self, peer: WgPeer) -> WgHandshake:
         """called by initiator: initiate a wireguard handshake with responder's public key.
