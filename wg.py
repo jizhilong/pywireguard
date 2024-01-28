@@ -271,6 +271,8 @@ class WgTransportKeyPair:
 class WgHandshake:
     def __init__(self, req: HandshakeInit, on_response: Callable[[HandshakeResponse], WgTransportKeyPair]):
         self.start_time = time.time()
+        self.expire_time = self.start_time + REKEY_ATTEMPT_TIME
+        self.resend_time = [self.start_time + 5, self.start_time + 15, self.start_time + 35]
         self.req = req
         self.on_response = on_response
 
@@ -313,8 +315,18 @@ class WgPeer:
             self.keep_alive_timer.reset()
 
     def _handshake(self, reason: str):
-        if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
-            return
+        if self.handshake:
+            now = time.time()
+            if now > self.handshake.expire_time:
+                logger.warning('last handshake failed within %s seconds', REKEY_ATTEMPT_TIME)
+                self.handshake = None
+            else:
+                if self.handshake.resend_time and now > self.handshake.resend_time[0]:
+                    self.logger.info('retransmitting handshake for timeout')
+                    self.node.write_udp(self.handshake.req, self.last_addr or self.endpoint)
+                    self.handshake.last_send_time = now
+                    self.handshake.resend_time.pop(0)
+                return
         self.logger.info('initiating handshake for: %s', reason)
         handshake = self.node.init_handshake(self)
         addr = self.last_addr or self.endpoint
