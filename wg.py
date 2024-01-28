@@ -1,6 +1,6 @@
 import base64
 import hashlib
-import io
+import heapq
 import json
 import logging
 import os
@@ -17,11 +17,12 @@ from fcntl import ioctl
 from typing import Callable
 
 from cryptography.exceptions import InvalidTag, InvalidSignature, InvalidKey
+from cryptography.hazmat.backends.openssl import aead, backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.hmac import HMAC
-from cryptography.hazmat.backends.openssl import aead, backend
+
 
 logger = logging.getLogger('wg')
 
@@ -122,6 +123,79 @@ def tai64n(now: float) -> bytes:
     return seconds.to_bytes(8, 'big') + nanoseconds.to_bytes(4, 'big')
 
 
+class TimerTask:
+    def __init__(self, delay: float, interval: float, callback, timer: 'Timer'):
+        self.delay = delay
+        self.interval = interval
+        self.callback = callback
+        self.timer = timer
+        self.next_tick = time.time() + delay
+        self.enabled = True
+
+    def __lt__(self, other):
+        """override < operator to make TimerTask comparable against next_tick timestamp."""
+        return self.next_tick < other.next_tick
+
+    def _trigger(self) -> None:
+        if not self.enabled:
+            return
+        self.callback()
+        if self.interval > 0:
+            self.next_tick = time.time() + self.interval
+        else:
+            self.enabled = False
+
+    def reset(self) -> None:
+        """reset the next_tick of this timer task with delay and interval unchanged."""
+        self.update(self.delay, self.interval)
+
+    def update(self, delay: float, interval: float) -> None:
+        """update the delay and interval of this timer task."""
+        self.delay = delay
+        self.interval = interval
+        self.next_tick = time.time() + delay
+        heapq.heapify(self.timer.tasks)
+
+    def cancel(self) -> None:
+        """cancel this timer task."""
+        self.enabled = False
+
+
+class Timer:
+    def __init__(self):
+        self.tasks = []
+
+    def next_tick(self) -> float | None:
+        """time to trigger the next nearest timer task, or None if there are no any tasks."""
+        if not self.tasks:
+            return None
+        return self.tasks[0].next_tick
+
+    def tick(self) -> None:
+        """trigger the next tick, or do nothing there is no expired task."""
+        if not self.tasks:
+            return
+        task = heapq.heappop(self.tasks)
+        if not task.enabled:
+            return
+        if task.next_tick > time.time():
+            heapq.heappush(self.tasks, task)
+        else:
+            task._trigger()
+            if task.enabled:
+                heapq.heappush(self.tasks, task)
+
+    def schedule(self, initial_delay: float, interval: float, callback) -> TimerTask:
+        """schedule a timer task."""
+        assert initial_delay > 0
+        task = TimerTask(initial_delay, interval, callback, self)
+        heapq.heappush(self.tasks, task)
+        return task
+
+
+timer = Timer()
+
+
 # utility to serialize/deserialize wireguard messages(handshake init/handshake response/data)
 # xx_format are for struct.pack/unpack
 # HandshakeInit/HandshakeResponse/DataMessage are namedtuples for ease of message manipulating
@@ -203,6 +277,7 @@ class WgHandshake:
 
 class WgPeer:
     def __init__(self, ip: str, endpoint: tuple[str, int], public: bytes, node: 'WgNode', psk: bytes):
+        self.logger = logging.getLogger(f'wg.{ip}')
         self.ip = ip
         self.ip_bytes = socket.inet_aton(ip)  # for fast comparison with dst address in ip packet
         self.endpoint = endpoint
@@ -214,39 +289,39 @@ class WgPeer:
         self.handshake: WgHandshake | None = None
         self.last_received_handshake_init_tai64n = b'\x00' * 12
         self.send_queue = queue.Queue()
+        self.expire_all_sessions_timer = None
+        self.keep_alive_timer = None
         self.last_addr = None
         self.last_received_time = None
-        self.last_send_time = time.time()
 
     def send_data(self, data: bytes | memoryview):
-        self.expire_all_sessions_if_necessary()
-        need_new_session = False
+        new_session_reason = ''
         cur = self.cur_session
         if not cur:
-            logger.info('no valid session yet, start new session')
-            need_new_session = True
+            new_session_reason = 'NO_SESSION'
         elif cur.send_count >= REJECT_AFTER_MESSAGES:
-            logger.info('session expired for maximum messages, start new session')
-            need_new_session = True
-        elif cur.is_initiator and cur.establish_time + REKEY_AFTER_TIME < time.time():
-            logger.info('session expired for rekey_after_time, start new session')
-            need_new_session = True
+            new_session_reason = 'REJECT_AFTER_MESSAGES'
+        elif cur.establish_time + REKEY_AFTER_TIME < time.time():
+            new_session_reason = 'REKEY_AFTER_TIME'
 
-        if need_new_session:
+        if new_session_reason:
             self.send_queue.put(bytes(data))
-            if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
-                return
-            handshake = self.node.init_handshake(self)
-            addr = self.last_addr or self.endpoint
-            self.node.write_udp(handshake.req, addr)
-            self.handshake = handshake
+            self._handshake(new_session_reason)
         else:
             data_msg = self.cur_session.encrypt_data(data)
             self.node.write_udp(data_msg, self.last_addr)
-            self.last_send_time = time.time()
+            self.keep_alive_timer.reset()
+
+    def _handshake(self, reason: str):
+        if self.handshake and time.time() < self.handshake.start_time + REKEY_ATTEMPT_TIME:
+            return
+        self.logger.info('initiating handshake for: %s', reason)
+        handshake = self.node.init_handshake(self)
+        addr = self.last_addr or self.endpoint
+        self.node.write_udp(handshake.req, addr)
+        self.handshake = handshake
 
     def decrypt_data(self, message: DataMessage) -> bytes | None:
-        self.expire_all_sessions_if_necessary()
         if not self.cur_session:
             return None
         if message.receiver_index == self.cur_session.local_id:
@@ -257,18 +332,29 @@ class WgPeer:
             return None
         return session.decrypt_data(message)
 
-    def expire_all_sessions_if_necessary(self):
-        if self.cur_session and self.cur_session.establish_time + REJECT_AFTER_TIME * 3 < time.time():
-            self.prev_session, self.cur_session, self.handshake = None, None, None
-            logger.info(f'all sessions expired')
+    def _expire_all_sessions(self):
+        self.prev_session, self.cur_session, self.handshake = None, None, None
+        self.logger.info(f'all sessions expired')
+        self.expire_all_sessions_timer = None
+
+    def _send_keepalive(self):
+        self.logger.info('sending keep alive.')
+        self.send_data(b'')
 
     def set_cur_session(self, session: WgTransportKeyPair):
         self.prev_session, self.cur_session, self.handshake = self.cur_session, session, None
-        logger.info(f'session rotated (prev, cur) = {self.prev_session}, {self.cur_session}')
+        self.logger.info(f'session rotated (prev, cur) = {self.prev_session}, {self.cur_session}')
+        if self.expire_all_sessions_timer:
+            self.expire_all_sessions_timer.reset()
+        else:
+            self.expire_all_sessions_timer = timer.schedule(REJECT_AFTER_TIME * 3, 0, self._expire_all_sessions)
         while not self.send_queue.empty():
             data = self.send_queue.get()
             self.node.write_udp(session.encrypt_data(data), self.last_addr)
-            self.last_send_time = time.time()
+        if self.keep_alive_timer:
+            self.keep_alive_timer.reset()
+        else:
+            self.keep_alive_timer = timer.schedule(KEEPALIVE_TIMEOUT, KEEPALIVE_TIMEOUT, self._send_keepalive)
 
 
 # include/uapi/linux/if_tun.h
@@ -419,9 +505,18 @@ class WgNode:
         self._setup_udp_sock()
         self._setup_tun_dev()
         selector = self._setup_selector()
-        last_check_alive_time = time.time()
         while True:
-            events = selector.select(1)
+            next_tick = timer.next_tick()
+            if next_tick is None:
+                timeout = None
+            else:
+                timeout = next_tick - time.time()
+                if timeout <= 0:
+                    timer.tick()
+                    continue
+            events = selector.select(timeout)
+            if next_tick and next_tick < time.time():
+                timer.tick()
             udp_ready = tun_ready = False
             for key, mask in events:
                 if key.fileobj is self.tun:
@@ -450,15 +545,6 @@ class WgNode:
                         self.sock_write_queue.pop(0)
                     except BlockingIOError:
                         pass
-
-            if time.time() - last_check_alive_time >= 1:
-                last_check_alive_time = time.time()
-                for peer in self.peers:
-                    if peer.last_received_time is None:
-                        continue
-                    if time.time() - peer.last_send_time >= KEEPALIVE_TIMEOUT:
-                        logger.info(f'sending keepalive to {peer.ip}')
-                        peer.send_data(b'')
 
     def on_tun_read(self, ip_packet: bytes | memoryview):
         """called when data read from tun(aka. ip packets to encapsulate in udp)"""
