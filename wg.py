@@ -4,7 +4,6 @@ import heapq
 import json
 import logging
 import os
-import queue
 import selectors
 import socket
 import struct
@@ -22,7 +21,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.hmac import HMAC
-
 
 logger = logging.getLogger('wg')
 
@@ -290,7 +288,7 @@ class WgPeer:
         self.cur_session: WgTransportKeyPair | None = None
         self.handshake: WgHandshake | None = None
         self.last_received_handshake_init_tai64n = b'\x00' * 12
-        self.send_queue = queue.Queue()
+        self.send_queue = []
         self.expire_all_sessions_timer = None
         self.keep_alive_timer = None
         self.last_addr = None
@@ -307,7 +305,9 @@ class WgPeer:
             new_session_reason = 'REKEY_AFTER_TIME'
 
         if new_session_reason:
-            self.send_queue.put(bytes(data))
+            if len(self.send_queue) >= 32:
+                self.send_queue.pop(0)
+            self.send_queue.append(bytes(data))
             self._handshake(new_session_reason)
         else:
             data_msg = self.cur_session.encrypt_data(data)
@@ -360,9 +360,9 @@ class WgPeer:
             self.expire_all_sessions_timer.reset()
         else:
             self.expire_all_sessions_timer = timer.schedule(REJECT_AFTER_TIME * 3, 0, self._expire_all_sessions)
-        while not self.send_queue.empty():
-            data = self.send_queue.get()
+        for data in self.send_queue:
             self.node.write_udp(session.encrypt_data(data), self.last_addr)
+        self.send_queue.clear()
         if self.keep_alive_timer:
             self.keep_alive_timer.reset()
         else:
